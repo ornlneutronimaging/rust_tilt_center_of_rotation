@@ -1,0 +1,18 @@
+[package]
+name = "tilt_center_of_rotation"
+version = "0.1.0"
+edition = "2024"
+description = "Standalone estimation of the rotation-axis tilt and center of rotation of a CT projection stack, from its 0/180-degree opposite pairs"
+
+[dependencies]
+chrono = "0.4"
+eframe = "0.35"
+egui = "0.35"
+egui_plot = "0.36"
+hdf5-metno = "0.10"
+rayon = "1.10"
+rfd = "0.17"
+serde_json = "1.0"
+
+[profile.release]
+opt-level = 3
