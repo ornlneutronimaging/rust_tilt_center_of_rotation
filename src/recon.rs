@@ -26,39 +26,45 @@ import algotom.rec.reconstruction as rec_mod
 sino_file, spec_file, out_file = sys.argv[1:4]
 with open(spec_file) as f:
     spec = json.load(f)
-sino = np.load(sino_file)  # (n_angles, width)
+sinos = np.load(sino_file)  # (n_tilts, n_angles, width)
 angles = np.array(spec["angles_rad"], dtype=np.float32)
 if spec["apply_log"]:
-    sino = (-np.log(np.clip(sino, 1e-6, None))).astype(np.float32)
+    sinos = (-np.log(np.clip(sinos, 1e-6, None))).astype(np.float32)
 outs = []
-for c in spec["centers"]:
-    r = rec_mod.gridrec_reconstruction(
-        sino,
-        float(c),
-        angles=angles,
-        ratio=1.0,
-        filter_name="shepp",
-        apply_log=False,
-        pad=100,
-        filter_par=0.9,
-        ncore=None,
-    )
-    outs.append(np.asarray(r, dtype=np.float32))
-np.save(out_file, np.stack(outs))
+for sino in sinos:
+    per_center = []
+    for c in spec["centers"]:
+        r = rec_mod.gridrec_reconstruction(
+            sino,
+            float(c),
+            angles=angles,
+            ratio=1.0,
+            filter_name="shepp",
+            apply_log=False,
+            pad=100,
+            filter_par=0.9,
+            ncore=None,
+        )
+        per_center.append(np.asarray(r, dtype=np.float32))
+    outs.append(np.stack(per_center))
+np.save(out_file, np.stack(outs))  # (n_tilts, n_centers, size, size)
 "#;
 
-/// One test reconstruction: the slices (one per center), each `size×size`.
+/// One test reconstruction: a slice per (tilt, center) combination, each
+/// `size×size`.
 pub struct ReconTest {
     pub row: usize,
+    pub tilts: Vec<f64>,
     pub centers: Vec<f64>,
     pub size: usize,
-    /// `centers.len() * size * size` f32 values.
+    /// `tilts.len() * centers.len() * size * size` f32 values.
     pub slices: Vec<f32>,
 }
 
 impl ReconTest {
-    pub fn slice(&self, k: usize) -> &[f32] {
+    pub fn slice(&self, tilt: usize, center: usize) -> &[f32] {
         let n = self.size * self.size;
+        let k = tilt * self.centers.len() + center;
         &self.slices[k * n..(k + 1) * n]
     }
 }
@@ -108,13 +114,13 @@ impl ReconTestJob {
     pub fn start(
         stack: std::sync::Arc<Stack>,
         row: usize,
-        tilt_deg: f64,
+        tilts: Vec<f64>,
         centers: Vec<f64>,
         apply_log: bool,
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run(&stack, row, tilt_deg, centers, apply_log));
+            let _ = tx.send(run(&stack, row, tilts, centers, apply_log));
         });
         Self { rx }
     }
@@ -127,14 +133,30 @@ impl ReconTestJob {
 fn run(
     stack: &Stack,
     row: usize,
-    tilt_deg: f64,
+    tilts: Vec<f64>,
     centers: Vec<f64>,
     apply_log: bool,
 ) -> Result<ReconTest, String> {
-    let (sino, angles) = extract_sinogram(stack, row, tilt_deg);
-    if angles.len() < 3 {
-        return Err("fewer than 3 projections carry an angle".to_owned());
+    if tilts.is_empty() || centers.is_empty() {
+        return Err("no tilt or center values to reconstruct".to_owned());
     }
+    // One sinogram per tilt candidate, stacked.
+    let mut sinos = Vec::new();
+    let mut n_angles = 0;
+    for &tilt in &tilts {
+        let (sino, angles) = extract_sinogram(stack, row, tilt);
+        if angles.len() < 3 {
+            return Err("fewer than 3 projections carry an angle".to_owned());
+        }
+        n_angles = angles.len();
+        sinos.extend(sino);
+    }
+    let angles: Vec<f64> = stack
+        .angles_deg
+        .iter()
+        .filter(|a| a.is_finite())
+        .map(|a| a.to_radians())
+        .collect();
     let scratch: PathBuf =
         std::env::temp_dir().join(format!("tilt_cor_gridrec_{}", std::process::id()));
     std::fs::create_dir_all(&scratch)
@@ -144,7 +166,11 @@ fn run(
     let script_file = scratch.join("gridrec_test.py");
     let out_file = scratch.join("out.npy");
     let result = (|| {
-        npy::write_f32(&sino_file, &[angles.len(), stack.width], &sino)?;
+        npy::write_f32(
+            &sino_file,
+            &[tilts.len(), n_angles, stack.width],
+            &sinos,
+        )?;
         let spec = serde_json::json!({
             "angles_rad": angles,
             "centers": centers,
@@ -172,17 +198,19 @@ fn run(
             ));
         }
         let (shape, slices) = npy::read_f32(&out_file)?;
-        let [k, s1, s2] = shape[..] else {
+        let [t, c, s1, s2] = shape[..] else {
             return Err(format!("unexpected reconstruction shape {shape:?}"));
         };
-        if k != centers.len() || s1 != s2 {
+        if t != tilts.len() || c != centers.len() || s1 != s2 {
             return Err(format!(
-                "unexpected reconstruction shape {shape:?} for {} centers",
+                "unexpected reconstruction shape {shape:?} for {} tilts × {} centers",
+                tilts.len(),
                 centers.len()
             ));
         }
         Ok(ReconTest {
             row,
+            tilts,
             centers,
             size: s1,
             slices,

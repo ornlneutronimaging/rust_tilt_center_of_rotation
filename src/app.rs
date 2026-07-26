@@ -71,16 +71,21 @@ pub struct TiltCorApp {
     recon_span: f64,
     /// Number of centers reconstructed (1 = the adopted center only).
     recon_steps: usize,
+    /// Sweep half-width around the base tilt, degrees.
+    recon_tilt_span: f64,
+    /// Number of tilts reconstructed (1 = the base tilt only).
+    recon_tilt_steps: usize,
     recon_use_tilt: bool,
     /// Apply −log to the sinogram first (transmission data).
     recon_log: bool,
     recon_job: Option<crate::recon::ReconTestJob>,
     recon_result: Option<crate::recon::ReconTest>,
     recon_error: Option<String>,
-    /// Which center of the sweep the window shows.
-    recon_idx: usize,
+    /// Which (tilt, center) of the sweep the window shows.
+    recon_t_idx: usize,
+    recon_c_idx: usize,
     recon_window: bool,
-    recon_tex: Option<(usize, egui::TextureHandle)>,
+    recon_tex: Option<((usize, usize), egui::TextureHandle)>,
 }
 
 /// 8-bit grayscale with a 1–99 percentile window, for display.
@@ -133,12 +138,15 @@ impl TiltCorApp {
             recon_row: 0,
             recon_span: 2.0,
             recon_steps: 5,
+            recon_tilt_span: 0.5,
+            recon_tilt_steps: 1,
             recon_use_tilt: true,
             recon_log: true,
             recon_job: None,
             recon_result: None,
             recon_error: None,
-            recon_idx: 0,
+            recon_t_idx: 0,
+            recon_c_idx: 0,
             recon_window: false,
             recon_tex: None,
         };
@@ -326,7 +334,8 @@ impl TiltCorApp {
             match job.poll() {
                 Some(Ok(test)) => {
                     self.recon_job = None;
-                    self.recon_idx = test.centers.len() / 2;
+                    self.recon_t_idx = test.tilts.len() / 2;
+                    self.recon_c_idx = test.centers.len() / 2;
                     self.recon_result = Some(test);
                     self.recon_tex = None;
                     self.recon_window = true;
@@ -632,6 +641,21 @@ impl TiltCorApp {
                 ui.add(egui::DragValue::new(&mut self.recon_steps).range(1..=15));
             });
             ui.end_row();
+            ui.label("tilts ± / count:").on_hover_text(
+                "also reconstructs this many tilts spread ± this far around the \
+                 base tilt (each with its own sinogram) — count 1 tests only \
+                 the base tilt",
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.recon_tilt_span)
+                        .speed(0.05)
+                        .range(0.0..=5.0)
+                        .suffix("°"),
+                );
+                ui.add(egui::DragValue::new(&mut self.recon_tilt_steps).range(1..=9));
+            });
+            ui.end_row();
         });
         ui.checkbox(&mut self.recon_use_tilt, "use the adopted tilt")
             .on_hover_text(
@@ -655,23 +679,25 @@ impl TiltCorApp {
                 .clicked()
                 && let Some(est) = self.adopted.and_then(|k| self.estimates.get(k))
             {
-                let centers: Vec<f64> = if self.recon_steps <= 1 {
-                    vec![est.cor]
-                } else {
-                    (0..self.recon_steps)
-                        .map(|k| {
-                            est.cor - self.recon_span
-                                + 2.0 * self.recon_span * k as f64
-                                    / (self.recon_steps as f64 - 1.0)
-                        })
-                        .collect()
+                let sweep = |base: f64, span: f64, steps: usize| -> Vec<f64> {
+                    if steps <= 1 {
+                        vec![base]
+                    } else {
+                        (0..steps)
+                            .map(|k| {
+                                base - span + 2.0 * span * k as f64 / (steps as f64 - 1.0)
+                            })
+                            .collect()
+                    }
                 };
-                let tilt = if self.recon_use_tilt { est.tilt_deg } else { 0.0 };
+                let centers = sweep(est.cor, self.recon_span, self.recon_steps);
+                let base_tilt = if self.recon_use_tilt { est.tilt_deg } else { 0.0 };
+                let tilts = sweep(base_tilt, self.recon_tilt_span, self.recon_tilt_steps);
                 self.recon_error = None;
                 self.recon_job = Some(crate::recon::ReconTestJob::start(
                     Arc::clone(&stack),
                     self.recon_row,
-                    tilt,
+                    tilts,
                     centers,
                     self.recon_log,
                 ));
@@ -758,7 +784,8 @@ impl TiltCorApp {
             }
             ui.label(
                 RichText::new(
-                    "red line = adopted rotation axis · yellow band = sampled rows",
+                    "red line = adopted axis · yellow band = sampled rows · \
+                     blue dashes = gridrec test slice",
                 )
                 .weak()
                 .size(11.0),
@@ -811,6 +838,20 @@ impl TiltCorApp {
                     [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
                     yellow,
                 );
+            }
+            // The slice the gridrec test reconstructs, following the field
+            // live.
+            let slice_y = row_y(self.recon_row.min(stack.height - 1));
+            for shape in egui::Shape::dashed_line(
+                &[
+                    egui::pos2(rect.left(), slice_y),
+                    egui::pos2(rect.right(), slice_y),
+                ],
+                egui::Stroke::new(1.2, Color32::from_rgb(90, 150, 255)),
+                6.0,
+                5.0,
+            ) {
+                ui.painter().add(shape);
             }
             // The adopted axis, drawn over the image.
             if let Some(est) = self.adopted.and_then(|k| self.estimates.get(k)) {
@@ -898,29 +939,46 @@ impl TiltCorApp {
             ui.label(RichText::new("no test reconstruction yet").weak());
             return;
         };
-        let last = test.centers.len() - 1;
-        self.recon_idx = self.recon_idx.min(last);
-        if last > 0 {
+        let last_c = test.centers.len() - 1;
+        let last_t = test.tilts.len() - 1;
+        self.recon_c_idx = self.recon_c_idx.min(last_c);
+        self.recon_t_idx = self.recon_t_idx.min(last_t);
+        if last_t > 0 {
             ui.horizontal(|ui| {
-                ui.label("center:");
-                ui.add(egui::Slider::new(&mut self.recon_idx, 0..=last).show_value(false));
+                ui.label("tilt:");
+                ui.add(egui::Slider::new(&mut self.recon_t_idx, 0..=last_t).show_value(false));
+                ui.label(format!("{:+.3}°", test.tilts[self.recon_t_idx]));
             });
         }
-        let center = test.centers[self.recon_idx];
+        if last_c > 0 {
+            ui.horizontal(|ui| {
+                ui.label("center:");
+                ui.add(egui::Slider::new(&mut self.recon_c_idx, 0..=last_c).show_value(false));
+                ui.label(format!("{:.2} px", test.centers[self.recon_c_idx]));
+            });
+        }
         ui.label(
             RichText::new(format!(
-                "slice row {}, center {center:.2} px — flip through the sweep: \
-                 the right center is the sharpest (no half-moon doubling)",
-                test.row
+                "slice row {}, tilt {:+.3}°, center {:.2} px — flip through the \
+                 sweeps: the right values give the sharpest slice (no half-moon \
+                 doubling)",
+                test.row,
+                test.tilts[self.recon_t_idx],
+                test.centers[self.recon_c_idx]
             ))
             .size(12.0),
         );
-        if self.recon_tex.as_ref().map(|(k, _)| *k) != Some(self.recon_idx) {
-            let image = gray_image(test.size, test.size, test.slice(self.recon_idx));
+        let key = (self.recon_t_idx, self.recon_c_idx);
+        if self.recon_tex.as_ref().map(|(k, _)| *k) != Some(key) {
+            let image = gray_image(
+                test.size,
+                test.size,
+                test.slice(self.recon_t_idx, self.recon_c_idx),
+            );
             let tex = ui
                 .ctx()
                 .load_texture("gridrec_slice", image, egui::TextureOptions::LINEAR);
-            self.recon_tex = Some((self.recon_idx, tex));
+            self.recon_tex = Some((key, tex));
         }
         if let Some((_, tex)) = &self.recon_tex {
             ui.add(
