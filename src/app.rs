@@ -571,9 +571,11 @@ impl TiltCorApp {
                 }
             }
             ui.label(
-                RichText::new("the red line is the adopted rotation axis")
-                    .weak()
-                    .size(11.0),
+                RichText::new(
+                    "red line = adopted rotation axis · yellow band = sampled rows",
+                )
+                .weak()
+                .size(11.0),
             );
         });
 
@@ -600,10 +602,32 @@ impl TiltCorApp {
                     .maintain_aspect_ratio(true)
                     .shrink_to_fit(),
             );
+            let rect = response.rect;
+            let (w, h) = (stack.width as f32, stack.height as f32);
+            // The sampled row range: everything outside it dimmed, its two
+            // bounds drawn in yellow. Follows the from/to fields live.
+            let row_y = |row: usize| rect.top() + (row as f32 / (h - 1.0)) * rect.height();
+            let shade = Color32::from_rgba_unmultiplied(0, 0, 0, 110);
+            let (top_y, bottom_y) = (row_y(self.y_top), row_y(self.y_bottom));
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(rect.min, egui::pos2(rect.right(), top_y)),
+                0.0,
+                shade,
+            );
+            ui.painter().rect_filled(
+                egui::Rect::from_min_max(egui::pos2(rect.left(), bottom_y), rect.max),
+                0.0,
+                shade,
+            );
+            let yellow = egui::Stroke::new(1.0, Color32::from_rgb(240, 200, 60));
+            for y in [top_y, bottom_y] {
+                ui.painter().line_segment(
+                    [egui::pos2(rect.left(), y), egui::pos2(rect.right(), y)],
+                    yellow,
+                );
+            }
             // The adopted axis, drawn over the image.
             if let Some(est) = self.adopted.and_then(|k| self.estimates.get(k)) {
-                let rect = response.rect;
-                let (w, h) = (stack.width as f32, stack.height as f32);
                 let to_screen = |col: f64, row: f64| {
                     egui::pos2(
                         rect.left() + (col as f32 / (w - 1.0)) * rect.width(),
