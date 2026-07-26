@@ -277,6 +277,55 @@ mod tests {
         }
     }
 
+    /// The full pipeline against the real pixi python — run manually with
+    /// `cargo test end_to_end_gridrec -- --ignored`.
+    #[test]
+    #[ignore]
+    fn end_to_end_gridrec() {
+        let (h, w, n) = (64, 96, 24);
+        // A disk phantom: every projection of a centered disk is the same
+        // chord-length profile, so any angle set reconstructs it.
+        let cx = (w as f64 - 1.0) / 2.0 + 3.0;
+        let profile: Vec<f32> = (0..w)
+            .map(|x| {
+                let d = x as f64 - cx;
+                (2.0 * (20.0f64.powi(2) - d * d).max(0.0).sqrt()) as f32
+            })
+            .collect();
+        let stack = Stack {
+            path: PathBuf::new(),
+            data: (0..n)
+                .flat_map(|_| {
+                    (0..h).flat_map(|_| profile.clone()).collect::<Vec<f32>>()
+                })
+                .collect(),
+            n,
+            height: h,
+            width: w,
+            angles_deg: (0..n).map(|i| i as f64 * 180.0 / n as f64).collect(),
+            center_of_rotation: None,
+            previous_corrections: Vec::new(),
+        };
+        let test = run(
+            &stack,
+            vec![5, 58],
+            vec![0.0, 0.2],
+            vec![cx - 1.0, cx, cx + 1.0],
+            false,
+        )
+        .unwrap();
+        assert_eq!(test.rows, vec![5, 58]);
+        assert_eq!(test.tilts.len(), 2);
+        assert_eq!(test.centers.len(), 3);
+        assert_eq!(test.size, w);
+        assert_eq!(test.slices.len(), 2 * 2 * 3 * w * w);
+        let center_px = test.slice(0, 0, 1)[(w / 2) * w + w / 2];
+        assert!(
+            center_px.is_finite() && center_px > 0.1,
+            "disk center reconstructed to {center_px}"
+        );
+    }
+
     #[test]
     fn nan_angles_are_skipped() {
         let mut s = stack(8, 9, 3);

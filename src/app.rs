@@ -173,6 +173,7 @@ impl TiltCorApp {
     }
 
     fn start_load(&mut self, path: PathBuf) {
+        crate::logger::log(format!("loading {}", path.display()));
         let (tx, rx) = channel();
         std::thread::spawn(move || {
             let _ = tx.send(stack::load(&path));
@@ -272,6 +273,10 @@ impl TiltCorApp {
             ));
             return;
         };
+        crate::logger::log(format!(
+            "applying tilt {:+.4}°, cor {:.2} px ({})",
+            est.tilt_deg, est.cor, est.method
+        ));
         algorithms::apply_tilt(stack, est.tilt_deg);
         stack.center_of_rotation = Some(est.cor);
         let record = serde_json::json!({
@@ -312,10 +317,15 @@ impl TiltCorApp {
         if let Some(rx) = &self.load_job {
             match rx.try_recv() {
                 Ok(Ok(stack)) => {
+                    crate::logger::log(format!(
+                        "stack loaded: {} projections {}x{}, cor in file: {:?}",
+                        stack.n, stack.height, stack.width, stack.center_of_rotation
+                    ));
                     self.load_job = None;
                     self.adopt_stack(stack);
                 }
                 Ok(Err(e)) => {
+                    crate::logger::error(format!("load failed: {e}"));
                     self.load_job = None;
                     self.load_error = Some(e);
                 }
@@ -325,6 +335,10 @@ impl TiltCorApp {
         if let Some(rx) = &self.est_job {
             match rx.try_recv() {
                 Ok(Ok((est, global))) => {
+                    crate::logger::log(format!(
+                        "estimated — {}: tilt {:+.4}°, cor {:.2} px, r² {:.4}",
+                        est.method, est.tilt_deg, est.cor, est.r2
+                    ));
                     self.est_job = None;
                     self.global_cor = global;
                     self.estimates.push(est);
@@ -332,6 +346,7 @@ impl TiltCorApp {
                     self.tex = None;
                 }
                 Ok(Err(e)) => {
+                    crate::logger::error(format!("estimation failed: {e}"));
                     self.est_job = None;
                     self.est_error = Some(e);
                 }
@@ -341,6 +356,10 @@ impl TiltCorApp {
         if let Some(rx) = &self.save_job {
             match rx.try_recv() {
                 Ok(result) => {
+                    match &result {
+                        Ok(msg) => crate::logger::log(msg.clone()),
+                        Err(e) => crate::logger::error(format!("save failed: {e}")),
+                    }
                     self.save_job = None;
                     self.save_status = Some(result);
                 }
@@ -350,6 +369,13 @@ impl TiltCorApp {
         if let Some(job) = &mut self.recon_job {
             match job.poll() {
                 Some(Ok(test)) => {
+                    crate::logger::log(format!(
+                        "gridrec test done: rows {:?}, {} tilts × {} centers, {}px slices",
+                        test.rows,
+                        test.tilts.len(),
+                        test.centers.len(),
+                        test.size
+                    ));
                     self.recon_job = None;
                     self.recon_t_idx = test.tilts.len() / 2;
                     self.recon_c_idx = test.centers.len() / 2;
@@ -358,6 +384,7 @@ impl TiltCorApp {
                     self.recon_window = true;
                 }
                 Some(Err(e)) => {
+                    crate::logger::error(format!("gridrec test failed: {e}"));
                     self.recon_job = None;
                     self.recon_error = Some(e);
                 }
@@ -735,6 +762,16 @@ impl TiltCorApp {
                 let centers = sweep(est.cor, self.recon_span, self.recon_steps);
                 let base_tilt = if self.recon_use_tilt { est.tilt_deg } else { 0.0 };
                 let tilts = sweep(base_tilt, self.recon_tilt_span, self.recon_tilt_steps);
+                crate::logger::log(format!(
+                    "gridrec test: rows [{}, {}], {} tilt(s) around {base_tilt:+.3}°, \
+                     {} center(s) around {:.2} px, apply_log {}",
+                    self.recon_row_top,
+                    self.recon_row_bottom,
+                    tilts.len(),
+                    centers.len(),
+                    est.cor,
+                    self.recon_log
+                ));
                 self.recon_error = None;
                 self.recon_job = Some(crate::recon::ReconTestJob::start(
                     Arc::clone(&stack),

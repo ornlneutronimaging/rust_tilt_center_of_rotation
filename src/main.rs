@@ -7,6 +7,7 @@
 use tilt_center_of_rotation::app::TiltCorApp;
 
 fn main() -> eframe::Result<()> {
+    tilt_center_of_rotation::logger::init();
     let path = std::env::args()
         .skip(1)
         .find(|a| !a.starts_with("--"))

@@ -5,6 +5,7 @@
 
 pub mod algorithms;
 pub mod app;
+pub mod logger;
 pub mod npy;
 pub mod pairs;
 pub mod recon;
