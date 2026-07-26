@@ -424,23 +424,45 @@ impl TiltCorApp {
         ui.label(RichText::new("Row sampling").strong());
         let h = stack.height;
         egui::Grid::new("params_grid").num_columns(2).show(ui, |ui| {
-            ui.label("rows from / to:");
+            ui.label("rows from / to:").on_hover_text(
+                "only this row range is used (the yellow band on the image) — \
+                 keep it on the sample, away from empty beam or the holder",
+            );
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut self.y_top).range(0..=h - 2));
                 ui.add(egui::DragValue::new(&mut self.y_bottom).range(1..=h - 1));
             });
             ui.end_row();
-            ui.label("every / band:");
-            ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.ystep).range(1..=h / 2));
-                ui.add(egui::DragValue::new(&mut self.band).range(1..=50));
-            });
+            ui.label("band spacing (rows):").on_hover_text(
+                "a sample point is taken every this many rows — smaller means \
+                 more points for the line fit, but a slower estimation",
+            );
+            ui.add(egui::DragValue::new(&mut self.ystep).range(1..=h / 2));
             ui.end_row();
-            ui.label("max shift (px):");
+            ui.label("band height (rows):").on_hover_text(
+                "each sample point averages this many adjacent rows before \
+                 matching — more rows means less noise per point, but smears a \
+                 strongly tilted axis",
+            );
+            ui.add(egui::DragValue::new(&mut self.band).range(1..=50));
+            ui.end_row();
+            ui.label("max shift (px):").on_hover_text(
+                "how far the 0° and flipped 180° profiles are slid against each \
+                 other — the axis is assumed within ± half of this from the \
+                 detector center; raise it if the axis is far off center",
+            );
             ui.add(egui::DragValue::new(&mut self.max_shift).range(2..=stack.width / 2));
             ui.end_row();
         });
         self.y_bottom = self.y_bottom.clamp(self.y_top + 1, h - 1);
+        ui.label(
+            RichText::new(format!(
+                "→ {} sample points for the fit (hover a label for what it does)",
+                algorithms::bands(h, &self.params()).len()
+            ))
+            .weak()
+            .size(11.0),
+        );
         ui.add_space(6.0);
 
         // Run.

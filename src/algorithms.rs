@@ -181,7 +181,8 @@ fn trimmed_fit(points: &[(f64, f64)]) -> Option<((f64, f64, f64), Vec<bool>)> {
 }
 
 /// Row bands of `params`, clamped to the stack: `(band_start, center_row)`.
-fn bands(height: usize, params: &Params) -> Vec<(usize, f64)> {
+/// Public so the UI can show how many sample points the settings produce.
+pub fn bands(height: usize, params: &Params) -> Vec<(usize, f64)> {
     let band = params.band.max(1);
     let top = params.y_top.min(height.saturating_sub(band));
     let bottom = params.y_bottom.min(height - 1);
