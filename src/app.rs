@@ -63,6 +63,47 @@ pub struct TiltCorApp {
     view: View,
     /// Cached texture, keyed by (pair index, view, adopted estimate index).
     tex: Option<((usize, u8, usize), egui::TextureHandle)>,
+
+    // The gridrec (FBP) test slice: judge the adopted tilt + center on an
+    // actual reconstruction (runs in the pixi python via algotom).
+    recon_row: usize,
+    /// Sweep half-width around the adopted center, px.
+    recon_span: f64,
+    /// Number of centers reconstructed (1 = the adopted center only).
+    recon_steps: usize,
+    recon_use_tilt: bool,
+    /// Apply −log to the sinogram first (transmission data).
+    recon_log: bool,
+    recon_job: Option<crate::recon::ReconTestJob>,
+    recon_result: Option<crate::recon::ReconTest>,
+    recon_error: Option<String>,
+    /// Which center of the sweep the window shows.
+    recon_idx: usize,
+    recon_window: bool,
+    recon_tex: Option<(usize, egui::TextureHandle)>,
+}
+
+/// 8-bit grayscale with a 1–99 percentile window, for display.
+fn gray_image(width: usize, height: usize, pixels: &[f32]) -> egui::ColorImage {
+    let mut sample: Vec<f32> = pixels
+        .iter()
+        .step_by((pixels.len() / 40_000).max(1))
+        .copied()
+        .filter(|v| v.is_finite())
+        .collect();
+    sample.sort_by(|a, b| a.total_cmp(b));
+    let (lo, hi) = if sample.is_empty() {
+        (0.0, 1.0)
+    } else {
+        let lo = sample[sample.len() / 100];
+        let hi = sample[sample.len() - 1 - sample.len() / 100];
+        if hi > lo { (lo, hi) } else { (lo, lo + 1.0) }
+    };
+    let gray: Vec<u8> = pixels
+        .iter()
+        .map(|&v| (((v - lo) / (hi - lo)).clamp(0.0, 1.0) * 255.0) as u8)
+        .collect();
+    egui::ColorImage::from_gray([width, height], &gray)
 }
 
 impl TiltCorApp {
@@ -89,6 +130,17 @@ impl TiltCorApp {
             save_status: None,
             view: View::Difference,
             tex: None,
+            recon_row: 0,
+            recon_span: 2.0,
+            recon_steps: 5,
+            recon_use_tilt: true,
+            recon_log: true,
+            recon_job: None,
+            recon_result: None,
+            recon_error: None,
+            recon_idx: 0,
+            recon_window: false,
+            recon_tex: None,
         };
         if let Some(path) = path {
             app.start_load(path);
@@ -122,6 +174,25 @@ impl TiltCorApp {
         self.est_error = None;
         self.save_status = None;
         self.tex = None;
+        self.recon_row = stack.height / 2;
+        // Transmission data sits around [0, 1]; attenuation goes well above.
+        // Preselect the −log toggle from a look at the first plane.
+        let mut sample: Vec<f32> = stack
+            .plane(0)
+            .iter()
+            .step_by((stack.height * stack.width / 10_000).max(1))
+            .copied()
+            .filter(|v| v.is_finite())
+            .collect();
+        sample.sort_by(|a, b| a.total_cmp(b));
+        self.recon_log = sample
+            .get(sample.len().saturating_sub(1 + sample.len() / 20))
+            .is_none_or(|&p95| p95 <= 2.0);
+        self.recon_job = None;
+        self.recon_result = None;
+        self.recon_error = None;
+        self.recon_window = false;
+        self.recon_tex = None;
         self.stack = Some(Arc::new(stack));
     }
 
@@ -201,11 +272,15 @@ impl TiltCorApp {
             let _ = tx.send(result);
         });
         self.save_job = Some(rx);
-        // The stack changed: previous estimates no longer describe it.
+        // The stack changed: previous estimates and test slices no longer
+        // describe it.
         self.estimates.clear();
         self.global_cor = None;
         self.adopted = None;
         self.tex = None;
+        self.recon_result = None;
+        self.recon_tex = None;
+        self.recon_window = false;
     }
 
     fn poll_jobs(&mut self, ctx: &egui::Context) {
@@ -245,6 +320,22 @@ impl TiltCorApp {
                     self.save_status = Some(result);
                 }
                 Err(_) => ctx.request_repaint_after(Duration::from_millis(300)),
+            }
+        }
+        if let Some(job) = &mut self.recon_job {
+            match job.poll() {
+                Some(Ok(test)) => {
+                    self.recon_job = None;
+                    self.recon_idx = test.centers.len() / 2;
+                    self.recon_result = Some(test);
+                    self.recon_tex = None;
+                    self.recon_window = true;
+                }
+                Some(Err(e)) => {
+                    self.recon_job = None;
+                    self.recon_error = Some(e);
+                }
+                None => ctx.request_repaint_after(Duration::from_millis(300)),
             }
         }
     }
@@ -288,26 +379,7 @@ impl TiltCorApp {
                 out
             }
         };
-        // Percentile window on a subsample.
-        let mut sample: Vec<f32> = pixels
-            .iter()
-            .step_by((pixels.len() / 40_000).max(1))
-            .copied()
-            .filter(|v| v.is_finite())
-            .collect();
-        sample.sort_by(|a, b| a.total_cmp(b));
-        let (lo, hi) = if sample.is_empty() {
-            (0.0, 1.0)
-        } else {
-            let lo = sample[sample.len() / 100];
-            let hi = sample[sample.len() - 1 - sample.len() / 100];
-            if hi > lo { (lo, hi) } else { (lo, lo + 1.0) }
-        };
-        let gray: Vec<u8> = pixels
-            .iter()
-            .map(|&v| (((v - lo) / (hi - lo)).clamp(0.0, 1.0) * 255.0) as u8)
-            .collect();
-        Some(egui::ColorImage::from_gray([w, h], &gray))
+        Some(gray_image(w, h, &pixels))
     }
 
     fn left_panel(&mut self, ui: &mut egui::Ui) {
@@ -528,6 +600,98 @@ impl TiltCorApp {
         }
         ui.separator();
 
+        // The gridrec test slice.
+        ui.label(RichText::new("Test with gridrec (FBP)").strong());
+        ui.label(
+            RichText::new(
+                "reconstruct one slice at the adopted center — and neighbors \
+                 around it — to judge the tilt and center on an actual \
+                 reconstruction",
+            )
+            .weak()
+            .size(11.0),
+        );
+        egui::Grid::new("recon_grid").num_columns(2).show(ui, |ui| {
+            ui.label("slice (row):").on_hover_text(
+                "the sinogram row that is reconstructed — pick a row with \
+                 sample features",
+            );
+            ui.add(egui::DragValue::new(&mut self.recon_row).range(0..=stack.height - 1));
+            ui.end_row();
+            ui.label("centers ± / count:").on_hover_text(
+                "also reconstructs this many centers spread ± this far around \
+                 the adopted one — flip through them to see which is sharpest",
+            );
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.recon_span)
+                        .speed(0.25)
+                        .range(0.0..=20.0)
+                        .suffix(" px"),
+                );
+                ui.add(egui::DragValue::new(&mut self.recon_steps).range(1..=15));
+            });
+            ui.end_row();
+        });
+        ui.checkbox(&mut self.recon_use_tilt, "use the adopted tilt")
+            .on_hover_text(
+                "extract the sinogram through the tilt rotation — uncheck to \
+                 compare what the reconstruction looks like without the \
+                 correction",
+            );
+        ui.checkbox(&mut self.recon_log, "transmission data — apply -log first")
+            .on_hover_text(
+                "gridrec needs attenuation data; leave this on for normalized \
+                 transmission (values around 0–1), off for a stack that is \
+                 already log-converted",
+            );
+        ui.horizontal(|ui| {
+            if ui
+                .add_enabled(
+                    self.adopted.is_some() && self.recon_job.is_none(),
+                    egui::Button::new("▶ Reconstruct the test slice"),
+                )
+                .on_disabled_hover_text("run an estimation and select a result first")
+                .clicked()
+                && let Some(est) = self.adopted.and_then(|k| self.estimates.get(k))
+            {
+                let centers: Vec<f64> = if self.recon_steps <= 1 {
+                    vec![est.cor]
+                } else {
+                    (0..self.recon_steps)
+                        .map(|k| {
+                            est.cor - self.recon_span
+                                + 2.0 * self.recon_span * k as f64
+                                    / (self.recon_steps as f64 - 1.0)
+                        })
+                        .collect()
+                };
+                let tilt = if self.recon_use_tilt { est.tilt_deg } else { 0.0 };
+                self.recon_error = None;
+                self.recon_job = Some(crate::recon::ReconTestJob::start(
+                    Arc::clone(&stack),
+                    self.recon_row,
+                    tilt,
+                    centers,
+                    self.recon_log,
+                ));
+            }
+            if self.recon_job.is_some() {
+                ui.spinner();
+                ui.label("gridrec…");
+            }
+        });
+        if let Some(e) = &self.recon_error {
+            ui.colored_label(Color32::LIGHT_RED, e);
+        }
+        if self.recon_result.is_some()
+            && !self.recon_window
+            && ui.button("🖼 Show the test slices").clicked()
+        {
+            self.recon_window = true;
+        }
+        ui.separator();
+
         // Apply.
         let can_apply = self.adopted.is_some()
             && self.apply_pending == 0
@@ -727,10 +891,60 @@ impl TiltCorApp {
     }
 }
 
+impl TiltCorApp {
+    /// The floating window flipping through the gridrec test slices.
+    fn recon_window_ui(&mut self, ui: &mut egui::Ui) {
+        let Some(test) = &self.recon_result else {
+            ui.label(RichText::new("no test reconstruction yet").weak());
+            return;
+        };
+        let last = test.centers.len() - 1;
+        self.recon_idx = self.recon_idx.min(last);
+        if last > 0 {
+            ui.horizontal(|ui| {
+                ui.label("center:");
+                ui.add(egui::Slider::new(&mut self.recon_idx, 0..=last).show_value(false));
+            });
+        }
+        let center = test.centers[self.recon_idx];
+        ui.label(
+            RichText::new(format!(
+                "slice row {}, center {center:.2} px — flip through the sweep: \
+                 the right center is the sharpest (no half-moon doubling)",
+                test.row
+            ))
+            .size(12.0),
+        );
+        if self.recon_tex.as_ref().map(|(k, _)| *k) != Some(self.recon_idx) {
+            let image = gray_image(test.size, test.size, test.slice(self.recon_idx));
+            let tex = ui
+                .ctx()
+                .load_texture("gridrec_slice", image, egui::TextureOptions::LINEAR);
+            self.recon_tex = Some((self.recon_idx, tex));
+        }
+        if let Some((_, tex)) = &self.recon_tex {
+            ui.add(
+                egui::Image::from_texture(tex)
+                    .max_size(egui::vec2(640.0, 640.0))
+                    .maintain_aspect_ratio(true)
+                    .shrink_to_fit(),
+            );
+        }
+    }
+}
+
 impl eframe::App for TiltCorApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll_jobs(&ctx);
+        if self.recon_window {
+            let mut open = true;
+            egui::Window::new("gridrec test slice")
+                .open(&mut open)
+                .default_size(egui::vec2(680.0, 740.0))
+                .show(&ctx, |ui| self.recon_window_ui(ui));
+            self.recon_window = open;
+        }
         // The two-step apply: draw one spinner frame, then do the work.
         match self.apply_pending {
             1 => {

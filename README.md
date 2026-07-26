@@ -28,6 +28,14 @@ The difference view (|0° − 180° mirrored about the adopted axis|) goes flat
 when the axis is right; the per-row axis positions and the fit are plotted
 below it.
 
+**Test with gridrec (FBP)** reconstructs one slice at the adopted center —
+and a sweep of centers around it — through algotom's
+`gridrec_reconstruction` (the same pixi Python environment
+`rust_ct_reconstruction` reconstructs with). The sinogram row is extracted
+through the to-be-applied tilt rotation, so flipping the "use the adopted
+tilt" toggle compares the reconstruction with and without the correction,
+and flipping through the center sweep shows which center is sharpest.
+
 **Apply the tilt & save** rotates every projection so the fitted axis is
 vertical (bilinear, edge-clamped), then writes `/projections`,
 `/center_of_rotation` and a JSON record of the correction
