@@ -50,21 +50,23 @@ for sino in sinos:
 np.save(out_file, np.stack(outs))  # (n_tilts, n_centers, size, size)
 "#;
 
-/// One test reconstruction: a slice per (tilt, center) combination, each
-/// `size×size`.
+/// One test reconstruction: a slice per (tilt, row, center) combination,
+/// each `size×size`. Two rows — one near the top, one near the bottom —
+/// are the real tilt test: a wrong tilt makes the best center differ
+/// between the two heights.
 pub struct ReconTest {
-    pub row: usize,
+    pub rows: Vec<usize>,
     pub tilts: Vec<f64>,
     pub centers: Vec<f64>,
     pub size: usize,
-    /// `tilts.len() * centers.len() * size * size` f32 values.
+    /// `tilts.len() * rows.len() * centers.len() * size * size` f32 values.
     pub slices: Vec<f32>,
 }
 
 impl ReconTest {
-    pub fn slice(&self, tilt: usize, center: usize) -> &[f32] {
+    pub fn slice(&self, tilt: usize, row: usize, center: usize) -> &[f32] {
         let n = self.size * self.size;
-        let k = tilt * self.centers.len() + center;
+        let k = (tilt * self.rows.len() + row) * self.centers.len() + center;
         &self.slices[k * n..(k + 1) * n]
     }
 }
@@ -113,14 +115,14 @@ pub struct ReconTestJob {
 impl ReconTestJob {
     pub fn start(
         stack: std::sync::Arc<Stack>,
-        row: usize,
+        rows: Vec<usize>,
         tilts: Vec<f64>,
         centers: Vec<f64>,
         apply_log: bool,
     ) -> Self {
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let _ = tx.send(run(&stack, row, tilts, centers, apply_log));
+            let _ = tx.send(run(&stack, rows, tilts, centers, apply_log));
         });
         Self { rx }
     }
@@ -132,24 +134,26 @@ impl ReconTestJob {
 
 fn run(
     stack: &Stack,
-    row: usize,
+    rows: Vec<usize>,
     tilts: Vec<f64>,
     centers: Vec<f64>,
     apply_log: bool,
 ) -> Result<ReconTest, String> {
-    if tilts.is_empty() || centers.is_empty() {
-        return Err("no tilt or center values to reconstruct".to_owned());
+    if rows.is_empty() || tilts.is_empty() || centers.is_empty() {
+        return Err("no row, tilt or center values to reconstruct".to_owned());
     }
-    // One sinogram per tilt candidate, stacked.
+    // One sinogram per (tilt, row) combination, stacked in that order.
     let mut sinos = Vec::new();
     let mut n_angles = 0;
     for &tilt in &tilts {
-        let (sino, angles) = extract_sinogram(stack, row, tilt);
-        if angles.len() < 3 {
-            return Err("fewer than 3 projections carry an angle".to_owned());
+        for &row in &rows {
+            let (sino, angles) = extract_sinogram(stack, row, tilt);
+            if angles.len() < 3 {
+                return Err("fewer than 3 projections carry an angle".to_owned());
+            }
+            n_angles = angles.len();
+            sinos.extend(sino);
         }
-        n_angles = angles.len();
-        sinos.extend(sino);
     }
     let angles: Vec<f64> = stack
         .angles_deg
@@ -168,7 +172,7 @@ fn run(
     let result = (|| {
         npy::write_f32(
             &sino_file,
-            &[tilts.len(), n_angles, stack.width],
+            &[tilts.len() * rows.len(), n_angles, stack.width],
             &sinos,
         )?;
         let spec = serde_json::json!({
@@ -198,18 +202,19 @@ fn run(
             ));
         }
         let (shape, slices) = npy::read_f32(&out_file)?;
-        let [t, c, s1, s2] = shape[..] else {
+        let [tr, c, s1, s2] = shape[..] else {
             return Err(format!("unexpected reconstruction shape {shape:?}"));
         };
-        if t != tilts.len() || c != centers.len() || s1 != s2 {
+        if tr != tilts.len() * rows.len() || c != centers.len() || s1 != s2 {
             return Err(format!(
-                "unexpected reconstruction shape {shape:?} for {} tilts × {} centers",
+                "unexpected reconstruction shape {shape:?} for {} tilts × {} rows × {} centers",
                 tilts.len(),
+                rows.len(),
                 centers.len()
             ));
         }
         Ok(ReconTest {
-            row,
+            rows,
             tilts,
             centers,
             size: s1,

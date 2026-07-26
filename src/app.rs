@@ -66,7 +66,10 @@ pub struct TiltCorApp {
 
     // The gridrec (FBP) test slice: judge the adopted tilt + center on an
     // actual reconstruction (runs in the pixi python via algotom).
-    recon_row: usize,
+    /// The two slices the test reconstructs — one near the top, one near
+    /// the bottom: a wrong tilt makes their best centers disagree.
+    recon_row_top: usize,
+    recon_row_bottom: usize,
     /// Sweep half-width around the adopted center, px.
     recon_span: f64,
     /// Number of centers reconstructed (1 = the adopted center only).
@@ -85,7 +88,19 @@ pub struct TiltCorApp {
     recon_t_idx: usize,
     recon_c_idx: usize,
     recon_window: bool,
-    recon_tex: Option<((usize, usize), egui::TextureHandle)>,
+    /// One texture per reconstructed row, keyed by (tilt, center).
+    recon_tex: Option<((usize, usize), Vec<egui::TextureHandle>)>,
+}
+
+/// Drag speed for a value field: holding Shift while dragging moves the
+/// value 10× FASTER (egui's built-in shift behavior divides the speed by
+/// 10, so ×100 here nets ×10).
+fn drag_speed(ui: &egui::Ui, base: f64) -> f64 {
+    if ui.input(|i| i.modifiers.shift_only()) {
+        base * 100.0
+    } else {
+        base
+    }
 }
 
 /// 8-bit grayscale with a 1–99 percentile window, for display.
@@ -135,7 +150,8 @@ impl TiltCorApp {
             save_status: None,
             view: View::Difference,
             tex: None,
-            recon_row: 0,
+            recon_row_top: 0,
+            recon_row_bottom: 0,
             recon_span: 2.0,
             recon_steps: 5,
             recon_tilt_span: 0.5,
@@ -182,7 +198,8 @@ impl TiltCorApp {
         self.est_error = None;
         self.save_status = None;
         self.tex = None;
-        self.recon_row = stack.height / 2;
+        self.recon_row_top = params.y_top;
+        self.recon_row_bottom = params.y_bottom;
         // Transmission data sits around [0, 1]; attenuation goes well above.
         // Preselect the −log toggle from a look at the first plane.
         let mut sample: Vec<f32> = stack
@@ -510,8 +527,16 @@ impl TiltCorApp {
                  keep it on the sample, away from empty beam or the holder",
             );
             ui.horizontal(|ui| {
-                ui.add(egui::DragValue::new(&mut self.y_top).range(0..=h - 2));
-                ui.add(egui::DragValue::new(&mut self.y_bottom).range(1..=h - 1));
+                ui.add(
+                    egui::DragValue::new(&mut self.y_top)
+                        .speed(drag_speed(ui, 1.0))
+                        .range(0..=h - 2),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.y_bottom)
+                        .speed(drag_speed(ui, 1.0))
+                        .range(1..=h - 1),
+                );
             });
             ui.end_row();
             ui.label("band spacing (rows):").on_hover_text(
@@ -532,13 +557,18 @@ impl TiltCorApp {
                  other — the axis is assumed within ± half of this from the \
                  detector center; raise it if the axis is far off center",
             );
-            ui.add(egui::DragValue::new(&mut self.max_shift).range(2..=stack.width / 2));
+            ui.add(
+                egui::DragValue::new(&mut self.max_shift)
+                    .speed(drag_speed(ui, 1.0))
+                    .range(2..=stack.width / 2),
+            );
             ui.end_row();
         });
         self.y_bottom = self.y_bottom.clamp(self.y_top + 1, h - 1);
         ui.label(
             RichText::new(format!(
-                "→ {} sample points for the fit (hover a label for what it does)",
+                "→ {} sample points for the fit — hover a label for what it \
+                 does; hold Shift while dragging a value to move 10× faster",
                 algorithms::bands(h, &self.params()).len()
             ))
             .weak()
@@ -609,23 +639,35 @@ impl TiltCorApp {
         }
         ui.separator();
 
-        // The gridrec test slice.
+        // The gridrec test slices.
         ui.label(RichText::new("Test with gridrec (FBP)").strong());
         ui.label(
             RichText::new(
-                "reconstruct one slice at the adopted center — and neighbors \
-                 around it — to judge the tilt and center on an actual \
-                 reconstruction",
+                "reconstruct TWO slices — one near the top, one near the bottom \
+                 — at the adopted values and neighbors around them: the right \
+                 tilt & center give sharp slices at BOTH heights",
             )
             .weak()
             .size(11.0),
         );
         egui::Grid::new("recon_grid").num_columns(2).show(ui, |ui| {
-            ui.label("slice (row):").on_hover_text(
-                "the sinogram row that is reconstructed — pick a row with \
-                 sample features",
+            ui.label("slices top / bottom:").on_hover_text(
+                "the two sinogram rows reconstructed (the blue dashed lines on \
+                 the image) — a wrong tilt makes the best center differ between \
+                 the two heights; pick rows with sample features",
             );
-            ui.add(egui::DragValue::new(&mut self.recon_row).range(0..=stack.height - 1));
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut self.recon_row_top)
+                        .speed(drag_speed(ui, 1.0))
+                        .range(0..=stack.height - 1),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut self.recon_row_bottom)
+                        .speed(drag_speed(ui, 1.0))
+                        .range(0..=stack.height - 1),
+                );
+            });
             ui.end_row();
             ui.label("centers ± / count:").on_hover_text(
                 "also reconstructs this many centers spread ± this far around \
@@ -696,7 +738,10 @@ impl TiltCorApp {
                 self.recon_error = None;
                 self.recon_job = Some(crate::recon::ReconTestJob::start(
                     Arc::clone(&stack),
-                    self.recon_row,
+                    vec![
+                        self.recon_row_top.min(stack.height - 1),
+                        self.recon_row_bottom.min(stack.height - 1),
+                    ],
                     tilts,
                     centers,
                     self.recon_log,
@@ -839,19 +884,21 @@ impl TiltCorApp {
                     yellow,
                 );
             }
-            // The slice the gridrec test reconstructs, following the field
-            // live.
-            let slice_y = row_y(self.recon_row.min(stack.height - 1));
-            for shape in egui::Shape::dashed_line(
-                &[
-                    egui::pos2(rect.left(), slice_y),
-                    egui::pos2(rect.right(), slice_y),
-                ],
-                egui::Stroke::new(1.2, Color32::from_rgb(90, 150, 255)),
-                6.0,
-                5.0,
-            ) {
-                ui.painter().add(shape);
+            // The two slices the gridrec test reconstructs, following the
+            // fields live.
+            for row in [self.recon_row_top, self.recon_row_bottom] {
+                let slice_y = row_y(row.min(stack.height - 1));
+                for shape in egui::Shape::dashed_line(
+                    &[
+                        egui::pos2(rect.left(), slice_y),
+                        egui::pos2(rect.right(), slice_y),
+                    ],
+                    egui::Stroke::new(1.2, Color32::from_rgb(90, 150, 255)),
+                    6.0,
+                    5.0,
+                ) {
+                    ui.painter().add(shape);
+                }
             }
             // The adopted axis, drawn over the image.
             if let Some(est) = self.adopted.and_then(|k| self.estimates.get(k)) {
@@ -959,10 +1006,10 @@ impl TiltCorApp {
         }
         ui.label(
             RichText::new(format!(
-                "slice row {}, tilt {:+.3}°, center {:.2} px — flip through the \
-                 sweeps: the right values give the sharpest slice (no half-moon \
-                 doubling)",
-                test.row,
+                "tilt {:+.3}°, center {:.2} px — flip through the sweeps: the \
+                 right values give sharp slices (no half-moon doubling) at BOTH \
+                 heights; if the top wants a different center than the bottom, \
+                 the tilt is wrong",
                 test.tilts[self.recon_t_idx],
                 test.centers[self.recon_c_idx]
             ))
@@ -970,23 +1017,47 @@ impl TiltCorApp {
         );
         let key = (self.recon_t_idx, self.recon_c_idx);
         if self.recon_tex.as_ref().map(|(k, _)| *k) != Some(key) {
-            let image = gray_image(
-                test.size,
-                test.size,
-                test.slice(self.recon_t_idx, self.recon_c_idx),
-            );
-            let tex = ui
-                .ctx()
-                .load_texture("gridrec_slice", image, egui::TextureOptions::LINEAR);
-            self.recon_tex = Some((key, tex));
+            let textures: Vec<egui::TextureHandle> = (0..test.rows.len())
+                .map(|r| {
+                    let image = gray_image(
+                        test.size,
+                        test.size,
+                        test.slice(self.recon_t_idx, r, self.recon_c_idx),
+                    );
+                    ui.ctx().load_texture(
+                        format!("gridrec_slice_{r}"),
+                        image,
+                        egui::TextureOptions::LINEAR,
+                    )
+                })
+                .collect();
+            self.recon_tex = Some((key, textures));
         }
-        if let Some((_, tex)) = &self.recon_tex {
-            ui.add(
-                egui::Image::from_texture(tex)
-                    .max_size(egui::vec2(640.0, 640.0))
-                    .maintain_aspect_ratio(true)
-                    .shrink_to_fit(),
-            );
+        if let Some((_, textures)) = &self.recon_tex {
+            let names = ["top", "bottom"];
+            let each = ((ui.available_width() - 16.0) / textures.len() as f32)
+                .clamp(160.0, 520.0);
+            ui.horizontal(|ui| {
+                for (r, tex) in textures.iter().enumerate() {
+                    ui.vertical(|ui| {
+                        ui.label(
+                            RichText::new(format!(
+                                "row {} ({})",
+                                test.rows[r],
+                                names.get(r).copied().unwrap_or("…")
+                            ))
+                            .strong()
+                            .size(12.0),
+                        );
+                        ui.add(
+                            egui::Image::from_texture(tex)
+                                .max_size(egui::vec2(each, each))
+                                .maintain_aspect_ratio(true)
+                                .shrink_to_fit(),
+                        );
+                    });
+                }
+            });
         }
     }
 }
@@ -997,9 +1068,9 @@ impl eframe::App for TiltCorApp {
         self.poll_jobs(&ctx);
         if self.recon_window {
             let mut open = true;
-            egui::Window::new("gridrec test slice")
+            egui::Window::new("gridrec test slices")
                 .open(&mut open)
-                .default_size(egui::vec2(680.0, 740.0))
+                .default_size(egui::vec2(1020.0, 640.0))
                 .show(&ctx, |ui| self.recon_window_ui(ui));
             self.recon_window = open;
         }
