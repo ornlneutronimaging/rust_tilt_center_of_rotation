@@ -88,8 +88,31 @@ pub struct TiltCorApp {
     recon_t_idx: usize,
     recon_c_idx: usize,
     recon_window: bool,
-    /// One texture per reconstructed row, keyed by (tilt, center).
-    recon_tex: Option<((usize, usize), Vec<egui::TextureHandle>)>,
+    /// One texture per reconstructed row (plus its value-range note),
+    /// keyed by (tilt, center).
+    recon_tex: Option<((usize, usize), Vec<(egui::TextureHandle, String)>)>,
+}
+
+/// `min … max` of the finite values, or a warning when there are none —
+/// shown under each test slice so bad data is visible instead of black.
+fn value_range_note(pixels: &[f32]) -> String {
+    let mut min = f32::INFINITY;
+    let mut max = f32::NEG_INFINITY;
+    let mut finite = 0usize;
+    for &v in pixels {
+        if v.is_finite() {
+            finite += 1;
+            min = min.min(v);
+            max = max.max(v);
+        }
+    }
+    if finite == 0 {
+        "⚠ every pixel is NaN".to_owned()
+    } else if min == max {
+        format!("⚠ constant value {min:.4}")
+    } else {
+        format!("values {min:.4} to {max:.4}")
+    }
 }
 
 /// Drag speed for a value field: holding Shift while dragging moves the
@@ -370,11 +393,13 @@ impl TiltCorApp {
             match job.poll() {
                 Some(Ok(test)) => {
                     crate::logger::log(format!(
-                        "gridrec test done: rows {:?}, {} tilts × {} centers, {}px slices",
+                        "gridrec test done: rows {:?}, {} tilts × {} centers, {}px slices, \
+                         first slice {}",
                         test.rows,
                         test.tilts.len(),
                         test.centers.len(),
-                        test.size
+                        test.size,
+                        value_range_note(test.slice(0, 0, 0))
                     ));
                     self.recon_job = None;
                     self.recon_t_idx = test.tilts.len() / 2;
@@ -1054,18 +1079,16 @@ impl TiltCorApp {
         );
         let key = (self.recon_t_idx, self.recon_c_idx);
         if self.recon_tex.as_ref().map(|(k, _)| *k) != Some(key) {
-            let textures: Vec<egui::TextureHandle> = (0..test.rows.len())
+            let textures: Vec<(egui::TextureHandle, String)> = (0..test.rows.len())
                 .map(|r| {
-                    let image = gray_image(
-                        test.size,
-                        test.size,
-                        test.slice(self.recon_t_idx, r, self.recon_c_idx),
-                    );
-                    ui.ctx().load_texture(
+                    let pixels = test.slice(self.recon_t_idx, r, self.recon_c_idx);
+                    let image = gray_image(test.size, test.size, pixels);
+                    let tex = ui.ctx().load_texture(
                         format!("gridrec_slice_{r}"),
                         image,
                         egui::TextureOptions::LINEAR,
-                    )
+                    );
+                    (tex, value_range_note(pixels))
                 })
                 .collect();
             self.recon_tex = Some((key, textures));
@@ -1075,7 +1098,7 @@ impl TiltCorApp {
             let each = ((ui.available_width() - 16.0) / textures.len() as f32)
                 .clamp(160.0, 520.0);
             ui.horizontal(|ui| {
-                for (r, tex) in textures.iter().enumerate() {
+                for (r, (tex, note)) in textures.iter().enumerate() {
                     ui.vertical(|ui| {
                         ui.label(
                             RichText::new(format!(
@@ -1088,10 +1111,14 @@ impl TiltCorApp {
                         );
                         ui.add(
                             egui::Image::from_texture(tex)
-                                .max_size(egui::vec2(each, each))
-                                .maintain_aspect_ratio(true)
-                                .shrink_to_fit(),
+                                .fit_to_exact_size(egui::vec2(each, each)),
                         );
+                        let warn = note.starts_with('⚠');
+                        ui.label(if warn {
+                            RichText::new(note).color(Color32::from_rgb(240, 180, 60)).size(11.0)
+                        } else {
+                            RichText::new(note).weak().size(11.0)
+                        });
                     });
                 }
             });

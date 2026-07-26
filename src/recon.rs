@@ -26,7 +26,8 @@ import algotom.rec.reconstruction as rec_mod
 sino_file, spec_file, out_file = sys.argv[1:4]
 with open(spec_file) as f:
     spec = json.load(f)
-sinos = np.load(sino_file)  # (n_tilts, n_angles, width)
+sinos = np.load(sino_file)  # (n_tilts * n_rows, n_angles, width)
+sinos = np.nan_to_num(sinos, nan=0.0, posinf=0.0, neginf=0.0)
 angles = np.array(spec["angles_rad"], dtype=np.float32)
 if spec["apply_log"]:
     sinos = (-np.log(np.clip(sinos, 1e-6, None))).astype(np.float32)
@@ -101,7 +102,9 @@ pub fn extract_sinogram(stack: &Stack, row: usize, tilt_deg: f64) -> (Vec<f32>, 
                 + f64::from(plane[y0 * w + x1]) * fx * (1.0 - fy)
                 + f64::from(plane[y1 * w + x0]) * (1.0 - fx) * fy
                 + f64::from(plane[y1 * w + x1]) * fx * fy;
-            sino.push(v as f32);
+            // A single NaN pixel (0/0 during normalization) would spread
+            // through gridrec's FFT to the whole slice — zero it instead.
+            sino.push(if v.is_finite() { v as f32 } else { 0.0 });
         }
         angles.push(a.to_radians());
     }
@@ -324,6 +327,15 @@ mod tests {
             center_px.is_finite() && center_px > 0.1,
             "disk center reconstructed to {center_px}"
         );
+    }
+
+    #[test]
+    fn nan_pixels_become_zero_in_the_sinogram() {
+        let mut s = stack(8, 9, 1);
+        s.data[3 * 9 + 4] = f32::NAN;
+        let (sino, _) = extract_sinogram(&s, 3, 0.0);
+        assert!(sino.iter().all(|v| v.is_finite()));
+        assert_eq!(sino[4], 0.0);
     }
 
     #[test]
